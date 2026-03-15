@@ -40,29 +40,16 @@ def calculate_iou(box1, box2):
     return inter_area / union_area
 
 # --- 1. SETUP VIDEO INPUT ---
-
-# [COMMENTED OUT FOR MP4 TESTING]
-# camera_index = 1
-# cap = cv2.VideoCapture(camera_index)
-# cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-# cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-
-# [ADDED FOR MP4 TESTING]
-# Place your video file in the same folder as this script, or provide the full path.
 video_path = "walking_hallway.mp4" 
 cap = cv2.VideoCapture(video_path)
 
 if not cap.isOpened():
-    print(f"❌ ERROR: Could not open video file at '{video_path}'. Please check the path and filename.")
+    print(f"❌ ERROR: Could not open video file at '{video_path}'.")
     exit()
 
-cv2.namedWindow("Store Tracking POC", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Store Tracking POC", 1280, 720) 
-
 # --- 2. SETUP AI MODELS ---
-model = YOLO("yolov8n.pt") 
+model = YOLO("yolov8x-seg.pt") 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device for ReID: {device}")
 
 resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
 feature_extractor = torch.nn.Sequential(*list(resnet.children())[:-1]).to(device)
@@ -80,32 +67,40 @@ box_annotator = sv.BoxAnnotator()
 label_annotator = sv.LabelAnnotator()
 
 entry_times = {}
-prev_frame_time = 0
-
+# customer_database is now a dictionary of LISTS: { "CUST-1": [emb1, emb2, emb3] }
 customer_database = {} 
 id_map = {} 
 next_customer_id = 1
 reid_match_scores = {} 
 
 # --- 4. MAIN LOOP PARAMETERS ---
-SIMILARITY_THRESHOLD = 0.70 
-ALPHA = 0.1 
+PROCESS_EVERY_N_FRAMES = 10
+SHOW_LIVE_VIDEO = True
+
+SIMILARITY_THRESHOLD = 0.55
 MIN_BOX_AREA = 8000 
 MAX_OVERLAP = 0.10  
+
+# --- NEW GALLERY PARAMETERS ---
+MAX_GALLERY_SIZE = 5         # Maximum number of angles to save per person
+GALLERY_UPDATE_THRESHOLD = 0.85 # If a frame is 85% similar to a saved angle, don't save it. If it's lower, save as a new angle!
+
+frame_count = 0
+start_time = time.time()
+
+print("🚀 Starting accelerated processing with Feature Gallery... Please wait.")
 
 # --- 5. MAIN LOOP ---
 while True:
     ret, frame = cap.read()
-    # If the video ends, break the loop naturally
     if not ret: 
-        print("End of video reached.")
         break
     
-    frame_height, frame_width = frame.shape[:2]
+    frame_count += 1
+    if frame_count % PROCESS_EVERY_N_FRAMES != 0:
+        continue
 
-    new_frame_time = time.time()
-    fps = 1 / (new_frame_time - prev_frame_time) if prev_frame_time > 0 else 0
-    prev_frame_time = new_frame_time
+    frame_height, frame_width = frame.shape[:2]
 
     results = model.track(frame, classes=[0], persist=True, tracker="botsort.yaml", verbose=False)[0] 
     detections = sv.Detections.from_ultralytics(results)
@@ -142,70 +137,104 @@ while True:
                         best_match_id = None
                         best_similarity = -1
                         
-                        for known_id, known_embedding in customer_database.items():
-                            similarity = F.cosine_similarity(embedding.unsqueeze(0), known_embedding.unsqueeze(0)).item()
-                            if similarity > best_similarity:
-                                best_similarity = similarity
-                                best_match_id = known_id
+                        # FEATURE GALLERY MATCHING LOGIC
+                        # Check the new crop against EVERY saved angle for EVERY customer
+                        for known_id, gallery in customer_database.items():
+                            for known_embedding in gallery:
+                                similarity = F.cosine_similarity(embedding.unsqueeze(0), known_embedding.unsqueeze(0)).item()
+                                if similarity > best_similarity:
+                                    best_similarity = similarity
+                                    best_match_id = known_id
 
                         if best_similarity > SIMILARITY_THRESHOLD:
                             id_map[yolo_id] = best_match_id
                             reid_match_scores[best_match_id] = best_similarity
-                            print(f"✅ SUCCESS: Re-linked to {best_match_id} (Score: {best_similarity:.2f})")
                         else:
                             persistent_id = f"CUST-{next_customer_id}"
                             id_map[yolo_id] = persistent_id
-                            customer_database[persistent_id] = embedding
+                            # Initialize the gallery as a LIST with the first embedding
+                            customer_database[persistent_id] = [embedding] 
                             entry_times[persistent_id] = current_time
                             reid_match_scores[persistent_id] = 1.0 
                             next_customer_id += 1
-                            print(f"🆕 CREATED: New profile {persistent_id}")
                     else:
                         hud_text = "Crop Error"
 
             # 2. EXISTING CUSTOMER
-            # [FIX APPLIED HERE: Changed 'if' to 'elif' to prevent double inference on the first frame]
             elif yolo_id in id_map:
                 p_id = id_map[yolo_id]
+                
+                # --- FIXED: CENTER FRAME RULE ---
+                margin_x = int(frame_width * 0.10) 
+                margin_y = int(frame_height * 0.10) 
+                is_center_frame = (bbox[0] > margin_x and bbox[1] > margin_y and 
+                                   bbox[2] < (frame_width - margin_x) and bbox[3] < (frame_height - margin_y))
                 
                 margin = 50
                 is_fully_in_frame = (bbox[0] > margin and bbox[1] > margin and bbox[2] < (frame_width - margin) and bbox[3] < (frame_height - margin))
                 
-                if is_fully_in_frame and not is_occluded:
+                # We only update the gallery if they are fully in frame, not occluded, AND in the center
+                if is_fully_in_frame and not is_occluded and is_center_frame:
                     current_embedding = get_embedding(frame, bbox)
                     if current_embedding is not None:
-                        old_embedding = customer_database[p_id]
-                        updated_embedding = (1.0 - ALPHA) * old_embedding + (ALPHA) * current_embedding
-                        customer_database[p_id] = F.normalize(updated_embedding, p=2, dim=0)
+                        gallery = customer_database[p_id]
+                        
+                        max_sim_to_gallery = max([F.cosine_similarity(current_embedding.unsqueeze(0), k_emb.unsqueeze(0)).item() for k_emb in gallery])
+                        
+                        if max_sim_to_gallery < GALLERY_UPDATE_THRESHOLD:
+                            gallery.append(current_embedding)
+                            if len(gallery) > MAX_GALLERY_SIZE:
+                                gallery.pop(0) 
+                                
+                        reid_match_scores[p_id] = max_sim_to_gallery
 
+                # --- ALWAYS GENERATE A LABEL ---
                 time_in_frame = current_time - entry_times.get(p_id, current_time)
                 reid_score = reid_match_scores.get(p_id, 1.0)
-                
                 occ_marker = "*" if is_occluded else ""
-                hud_text = f"{p_id}{occ_marker} | {time_in_frame:.0f}s | YOLO:{yolo_conf:.2f} | ReID:{reid_score:.2f}"
+                
+                gallery_size = len(customer_database.get(p_id, []))
+                
+                # I added a little "(EDGE)" marker to the HUD so you can visually see when the rule is active!
+                edge_marker = "" if is_center_frame else " (EDGE)"
+                
+                hud_text = f"{p_id}{occ_marker}{edge_marker} | Angles: {gallery_size} | YOLO:{yolo_conf:.2f} | ReID:{reid_score:.2f}"
                 
             labels.append(hud_text)
 
-    annotated_frame = box_annotator.annotate(scene=frame, detections=detections)
-    if labels:
-        annotated_frame = label_annotator.annotate(
-            scene=annotated_frame, detections=detections, labels=labels
-        )
+    if SHOW_LIVE_VIDEO:
+        annotated_frame = box_annotator.annotate(scene=frame, detections=detections)
+        if labels:
+            annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
 
-    cv2.putText(annotated_frame, f"RES: {frame_width}x{frame_height} | FPS: {int(fps)}", (20, 50), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-    
-    cv2.imshow("Store Tracking POC", annotated_frame)
+        # --- RESIZE DISPLAY WINDOW ---
+        # Multiply by 0.5 to cut the size in half. Change to 0.75 or 0.3 depending on your screen size!
+        scale_factor = 0.5 
+        display_width = int(frame_width * scale_factor)
+        display_height = int(frame_height * scale_factor)
+        display_frame = cv2.resize(annotated_frame, (display_width, display_height))
 
-    # Press 'q' to quit early, or spacebar to pause the video
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'): 
-        break
-    elif key == ord(' '): 
-        cv2.waitKey(0) # Pauses until you press spacebar again
+        # Show the newly resized frame instead of the massive original one
+        cv2.imshow("Store Tracking POC", display_frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): 
+            break
 
-cap.release()
-cv2.destroyAllWindows()
+# --- AUTOMATIC SUMMARY REPORT ---
+total_time = time.time() - start_time
+print("\n" + "="*40)
+print("📊 FEATURE GALLERY SUMMARY")
+print("="*40)
+print(f"⏱️  Processing Time:  {total_time:.1f} seconds")
+print(f"🎞️  Frames Processed: {frame_count // PROCESS_EVERY_N_FRAMES}")
+print(f"👥 Total Profiles Created: {len(customer_database)} (Target: 2)")
+print(f"🎚️  Match Threshold:  {SIMILARITY_THRESHOLD}")
+print(f"🖼️  Gallery Limit:    {MAX_GALLERY_SIZE} angles per person")
+print("="*40 + "\n")
+
+# Print out exactly how many angles each profile learned
+print("📸 Profile Gallery Details:")
+for pid, gallery in customer_database.items():
+    print(f"   - {pid}: Captured {len(gallery)} distinct angles.")
 
 cap.release()
 cv2.destroyAllWindows()
