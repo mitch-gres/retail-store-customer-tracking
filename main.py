@@ -7,6 +7,35 @@ import torchvision.models as models
 import torchvision.transforms as T
 import torch.nn.functional as F
 import numpy as np
+import os 
+
+# ==========================================
+# 🎛️ MAIN CONTROL PANEL
+# ==========================================
+# 1. INPUT SOURCE
+USE_LIVE_CAMERA = False          
+CAMERA_INDEX = 1                 
+VIDEO_PATH = "walking_hallway_3.mp4" 
+
+# 2. OUTPUT & DISPLAY
+SHOW_LIVE_VIDEO = True           
+SAVE_OUTPUT_VIDEO = True         
+PROCESS_EVERY_N_FRAMES = 5      
+
+# 3. AI & TRACKING THRESHOLDS
+SIMILARITY_THRESHOLD = 0.65      
+MIN_BOX_AREA = 8000              
+MAX_OVERLAP = 0.05               
+
+# 4. FEATURE GALLERY SETTINGS
+MAX_GALLERY_SIZE = 5             
+GALLERY_UPDATE_THRESHOLD = 0.8  
+
+# 5. TIME TRACKING DISPLAY (NEW)
+TIME_WARNING_THRESHOLD = 30      # Seconds in aisle before text turns YELLOW
+TIME_ALERT_THRESHOLD = 60        # Seconds in aisle before text turns RED
+AISLE_RESET_TIMEOUT = 3.0        # Seconds out of frame before "Aisle Time" resets
+# ==========================================
 
 # --- HELPER FUNCTION: Get Clothing Fingerprint ---
 def get_embedding(frame, bbox):
@@ -40,14 +69,39 @@ def calculate_iou(box1, box2):
     return inter_area / union_area
 
 # --- 1. SETUP VIDEO INPUT ---
-video_path = "walking_hallway.mp4" 
-cap = cv2.VideoCapture(video_path)
+if USE_LIVE_CAMERA:
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    print("📷 Using Live Camera Feed...")
+else:
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    print(f"🎬 Using Video File: {VIDEO_PATH}")
 
 if not cap.isOpened():
-    print(f"❌ ERROR: Could not open video file at '{video_path}'.")
+    print("❌ ERROR: Could not open video source.")
     exit()
 
-# --- 2. SETUP AI MODELS ---
+# --- 2. SETUP VIDEO WRITER ---
+if SAVE_OUTPUT_VIDEO:
+    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    original_fps = int(cap.get(cv2.CAP_PROP_FPS))
+    if original_fps == 0: original_fps = 30 
+    
+    output_fps = max(1, original_fps // PROCESS_EVERY_N_FRAMES)
+    
+    if USE_LIVE_CAMERA:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        output_path = f"live_tracking_{timestamp}.mp4"
+    else:
+        base_name, ext = os.path.splitext(VIDEO_PATH)
+        output_path = f"{base_name}_tracked{ext}"
+        
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, output_fps, (original_width, original_height))
+
+# --- 3. SETUP AI MODELS ---
 model = YOLO("yolov8x-seg.pt") 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -62,33 +116,25 @@ transform = T.Compose([
     T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# --- 3. STORAGE & DATABASES ---
+# --- 4. STORAGE & DATABASES ---
 box_annotator = sv.BoxAnnotator()
 label_annotator = sv.LabelAnnotator()
 
-entry_times = {}
-# customer_database is now a dictionary of LISTS: { "CUST-1": [emb1, emb2, emb3] }
+# --- TIME TRACKING DICTS ---
+store_entry_times = {}   
+aisle_entry_times = {}   
+last_seen_times = {}     
+aisle_visit_counts = {}  
+
 customer_database = {} 
 id_map = {} 
 next_customer_id = 1
 reid_match_scores = {} 
 
-# --- 4. MAIN LOOP PARAMETERS ---
-PROCESS_EVERY_N_FRAMES = 10
-SHOW_LIVE_VIDEO = True
-
-SIMILARITY_THRESHOLD = 0.55
-MIN_BOX_AREA = 8000 
-MAX_OVERLAP = 0.10  
-
-# --- NEW GALLERY PARAMETERS ---
-MAX_GALLERY_SIZE = 5         # Maximum number of angles to save per person
-GALLERY_UPDATE_THRESHOLD = 0.85 # If a frame is 85% similar to a saved angle, don't save it. If it's lower, save as a new angle!
-
 frame_count = 0
 start_time = time.time()
 
-print("🚀 Starting accelerated processing with Feature Gallery... Please wait.")
+print("🚀 Starting processing... Please wait.")
 
 # --- 5. MAIN LOOP ---
 while True:
@@ -106,6 +152,8 @@ while True:
     detections = sv.Detections.from_ultralytics(results)
 
     labels = []
+    currently_in_frame_pids = set() 
+
     if detections.tracker_id is not None:
         current_time = time.time() 
         
@@ -137,8 +185,6 @@ while True:
                         best_match_id = None
                         best_similarity = -1
                         
-                        # FEATURE GALLERY MATCHING LOGIC
-                        # Check the new crop against EVERY saved angle for EVERY customer
                         for known_id, gallery in customer_database.items():
                             for known_embedding in gallery:
                                 similarity = F.cosine_similarity(embedding.unsqueeze(0), known_embedding.unsqueeze(0)).item()
@@ -152,9 +198,13 @@ while True:
                         else:
                             persistent_id = f"CUST-{next_customer_id}"
                             id_map[yolo_id] = persistent_id
-                            # Initialize the gallery as a LIST with the first embedding
                             customer_database[persistent_id] = [embedding] 
-                            entry_times[persistent_id] = current_time
+                            
+                            store_entry_times[persistent_id] = current_time
+                            aisle_entry_times[persistent_id] = current_time
+                            last_seen_times[persistent_id] = current_time
+                            aisle_visit_counts[persistent_id] = 1  
+                            
                             reid_match_scores[persistent_id] = 1.0 
                             next_customer_id += 1
                     else:
@@ -163,22 +213,29 @@ while True:
             # 2. EXISTING CUSTOMER
             elif yolo_id in id_map:
                 p_id = id_map[yolo_id]
+                currently_in_frame_pids.add(p_id) 
                 
-                # --- FIXED: CENTER FRAME RULE ---
+                if current_time - last_seen_times.get(p_id, current_time) > AISLE_RESET_TIMEOUT:
+                    aisle_entry_times[p_id] = current_time
+                    aisle_visit_counts[p_id] = aisle_visit_counts.get(p_id, 0) + 1 
+                last_seen_times[p_id] = current_time
+                
+                center_x = (bbox[0] + bbox[2]) / 2
+                center_y = (bbox[1] + bbox[3]) / 2
+                
                 margin_x = int(frame_width * 0.10) 
                 margin_y = int(frame_height * 0.10) 
-                is_center_frame = (bbox[0] > margin_x and bbox[1] > margin_y and 
-                                   bbox[2] < (frame_width - margin_x) and bbox[3] < (frame_height - margin_y))
+                
+                is_center_frame = (margin_x < center_x < (frame_width - margin_x) and 
+                                   margin_y < center_y < (frame_height - margin_y))
                 
                 margin = 50
                 is_fully_in_frame = (bbox[0] > margin and bbox[1] > margin and bbox[2] < (frame_width - margin) and bbox[3] < (frame_height - margin))
                 
-                # We only update the gallery if they are fully in frame, not occluded, AND in the center
                 if is_fully_in_frame and not is_occluded and is_center_frame:
                     current_embedding = get_embedding(frame, bbox)
                     if current_embedding is not None:
                         gallery = customer_database[p_id]
-                        
                         max_sim_to_gallery = max([F.cosine_similarity(current_embedding.unsqueeze(0), k_emb.unsqueeze(0)).item() for k_emb in gallery])
                         
                         if max_sim_to_gallery < GALLERY_UPDATE_THRESHOLD:
@@ -188,33 +245,62 @@ while True:
                                 
                         reid_match_scores[p_id] = max_sim_to_gallery
 
-                # --- ALWAYS GENERATE A LABEL ---
-                time_in_frame = current_time - entry_times.get(p_id, current_time)
                 reid_score = reid_match_scores.get(p_id, 1.0)
                 occ_marker = "*" if is_occluded else ""
                 
                 gallery_size = len(customer_database.get(p_id, []))
-                
-                # I added a little "(EDGE)" marker to the HUD so you can visually see when the rule is active!
                 edge_marker = "" if is_center_frame else " (EDGE)"
                 
                 hud_text = f"{p_id}{occ_marker}{edge_marker} | Angles: {gallery_size} | YOLO:{yolo_conf:.2f} | ReID:{reid_score:.2f}"
                 
             labels.append(hud_text)
 
-    if SHOW_LIVE_VIDEO:
-        annotated_frame = box_annotator.annotate(scene=frame, detections=detections)
+    annotated_frame = frame.copy()
+    if len(detections) > 0:
+        annotated_frame = box_annotator.annotate(scene=annotated_frame, detections=detections)
         if labels:
             annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
 
-        # --- RESIZE DISPLAY WINDOW ---
-        # Multiply by 0.5 to cut the size in half. Change to 0.75 or 0.3 depending on your screen size!
+    # ==========================================
+    # ⏱️ DRAW TOP-RIGHT TIME TRACKING HUD
+    # ==========================================
+    current_time = time.time()
+    y_offset = 40 
+    
+    for p_id in sorted(list(currently_in_frame_pids)):
+        store_time = current_time - store_entry_times.get(p_id, current_time)
+        aisle_time = current_time - aisle_entry_times.get(p_id, current_time)
+        visit_count = aisle_visit_counts.get(p_id, 1) 
+        
+        # --- NEW COLOR LOGIC ---
+        if aisle_time > TIME_ALERT_THRESHOLD:
+            text_color = (0, 0, 255) # Red (Highest priority)
+        elif aisle_time > TIME_WARNING_THRESHOLD or visit_count > 1:
+            text_color = (0, 255, 255) # Yellow (If warning time hit OR multiple visits)
+        else:
+            text_color = (255, 255, 255) # White
+        # -----------------------
+            
+        display_text = f"{p_id} | Visits: {visit_count} | Aisle: {aisle_time:.1f}s | Store: {store_time:.1f}s"
+        
+        (text_width, text_height), _ = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        x_pos = frame_width - text_width - 20
+        
+        cv2.rectangle(annotated_frame, (x_pos - 10, y_offset - text_height - 10), (x_pos + text_width + 10, y_offset + 10), (0, 0, 0), -1)
+        cv2.putText(annotated_frame, display_text, (x_pos, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
+        
+        y_offset += 45 
+    # ==========================================
+
+    if SAVE_OUTPUT_VIDEO:
+        out.write(annotated_frame)
+
+    if SHOW_LIVE_VIDEO:
         scale_factor = 0.5 
         display_width = int(frame_width * scale_factor)
         display_height = int(frame_height * scale_factor)
         display_frame = cv2.resize(annotated_frame, (display_width, display_height))
 
-        # Show the newly resized frame instead of the massive original one
         cv2.imshow("Store Tracking POC", display_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'): 
             break
@@ -226,15 +312,9 @@ print("📊 FEATURE GALLERY SUMMARY")
 print("="*40)
 print(f"⏱️  Processing Time:  {total_time:.1f} seconds")
 print(f"🎞️  Frames Processed: {frame_count // PROCESS_EVERY_N_FRAMES}")
-print(f"👥 Total Profiles Created: {len(customer_database)} (Target: 2)")
-print(f"🎚️  Match Threshold:  {SIMILARITY_THRESHOLD}")
-print(f"🖼️  Gallery Limit:    {MAX_GALLERY_SIZE} angles per person")
-print("="*40 + "\n")
-
-# Print out exactly how many angles each profile learned
-print("📸 Profile Gallery Details:")
-for pid, gallery in customer_database.items():
-    print(f"   - {pid}: Captured {len(gallery)} distinct angles.")
+print(f"👥 Total Profiles Created: {len(customer_database)}")
 
 cap.release()
+if SAVE_OUTPUT_VIDEO:
+    out.release()
 cv2.destroyAllWindows()
