@@ -5,8 +5,7 @@ An advanced computer vision pipeline designed to track and re-identify customers
 ### 🎥 Demonstration
 
 <div align="center">
-<video src="https://github.com/mitch-gres/retail-store-customer-tracking/blob/main/walking_hallway_3_tracked_hud.mp4" width="100%" controls autoplay></video>    Your browser does not support the video tag.
-  </video>
+<video src="https://github.com/mitch-gres/retail-store-customer-tracking/blob/main/walking_hallway_3_tracked_hud.mp4" width="100%" controls autoplay></video>    
 </div>
 
 ---
